@@ -276,6 +276,8 @@ async def _run_workflow_session(
     turn_id = workflow_conv["message"][-1].get("id") if workflow_conv["message"] else get_uuid()
     full_content = ""
     reference = {}
+    segments = []
+    segment_content = ""
     final_ans = {}
     trace_items = []
     structured_output = {}
@@ -288,18 +290,33 @@ async def _run_workflow_session(
     if chat_template_kwargs is not None:
         run_kwargs["chat_template_kwargs"] = chat_template_kwargs
 
+    def flush_segment(seg_reference=None):
+        nonlocal segment_content
+        if segment_content or seg_reference is not None:
+            segments.append(
+                {
+                    "content": segment_content,
+                    "reference": seg_reference if seg_reference is not None else reference,
+                }
+            )
+        segment_content = ""
+
     async def persist_workflow_session():
         if not final_ans:
             return
-        workflow_conv["message"].append(
-            {
-                "role": "assistant",
-                "content": full_content,
-                "created_at": time.time(),
-                "id": turn_id,
-            }
-        )
-        workflow_conv["reference"].append(_normalize_agent_reference_entry(reference))
+        persisted = [seg for seg in segments if seg.get("content")]
+        if not persisted:
+            persisted = [{"content": full_content, "reference": reference}]
+        for i, seg in enumerate(persisted):
+            workflow_conv["message"].append(
+                {
+                    "role": "assistant",
+                    "content": seg["content"],
+                    "created_at": time.time(),
+                    "id": turn_id if len(persisted) == 1 else f"{turn_id}-{i}",
+                }
+            )
+            workflow_conv["reference"].append(_normalize_agent_reference_entry(seg.get("reference") or reference))
         workflow_conv["dsl"] = json.loads(str(canvas))
         workflow_conv["source"] = workflow_conv.get("source") or "workflow"
         await thread_pool_exec(API4ConversationService.append_message, session_id, workflow_conv)
@@ -308,17 +325,23 @@ async def _run_workflow_session(
     if stream:
 
         async def sse():
-            nonlocal full_content, reference, final_ans, trace_items, structured_output
+            nonlocal full_content, reference, final_ans, trace_items, structured_output, segment_content
             done_sent = False
             try:
                 async for ans in canvas.run(**run_kwargs):
                     ans["session_id"] = session_id
                     if ans.get("event") == "message":
-                        full_content += ans.get("data", {}).get("content", "")
+                        content = ans.get("data", {}).get("content", "")
+                        full_content += content
+                        segment_content += content
                         if ans.get("data", {}).get("start_to_think", False):
                             full_content += "<think>"
+                            segment_content += "<think>"
                         elif ans.get("data", {}).get("end_to_think", False):
                             full_content += "</think>"
+                            segment_content += "</think>"
+                    if ans.get("event") == "message_end":
+                        flush_segment(ans.get("data", {}).get("reference") or reference)
                     if ans.get("data", {}).get("reference", None):
                         reference.update(ans["data"]["reference"])
                     if ans.get("event") == "node_finished":
@@ -358,12 +381,14 @@ async def _run_workflow_session(
                         True,
                     )
                     yield ("data:" + json.dumps({"session_id": session_id, "data": {}}, ensure_ascii=False) + "\n\n")
+                flush_segment()
                 await persist_workflow_session()
             except Exception as exc:
                 logging.exception(exc)
                 canvas.cancel_task()
                 yield ("data:" + json.dumps({"code": 500, "message": str(exc), "data": False}, ensure_ascii=False) + "\n\n")
             finally:
+                canvas.close()
                 if not done_sent:
                     done_sent = True
                     yield "data:[DONE]\n\n"
@@ -374,11 +399,17 @@ async def _run_workflow_session(
         async for ans in canvas.run(**run_kwargs):
             ans["session_id"] = session_id
             if ans.get("event") == "message":
-                full_content += ans.get("data", {}).get("content", "")
+                content = ans.get("data", {}).get("content", "")
+                full_content += content
+                segment_content += content
                 if ans.get("data", {}).get("start_to_think", False):
                     full_content += "<think>"
+                    segment_content += "<think>"
                 elif ans.get("data", {}).get("end_to_think", False):
                     full_content += "</think>"
+                    segment_content += "</think>"
+            if ans.get("event") == "message_end":
+                flush_segment(ans.get("data", {}).get("reference") or reference)
             if ans.get("data", {}).get("reference", None):
                 reference.update(ans["data"]["reference"])
             if ans.get("event") == "node_finished":
@@ -398,6 +429,7 @@ async def _run_workflow_session(
     except Exception as exc:
         logging.exception(exc)
         canvas.cancel_task()
+        canvas.close()
         return get_result(data=f"**ERROR**: {str(exc)}")
 
     if not final_ans:
@@ -412,6 +444,7 @@ async def _run_workflow_session(
             False,
         )
         await commit_runtime_replica()
+        canvas.close()
         return get_result(data={"session_id": session_id})
 
     if "data" not in final_ans or not isinstance(final_ans["data"], dict):
@@ -423,7 +456,9 @@ async def _run_workflow_session(
     if trace_items:
         final_ans["data"]["trace"] = trace_items
 
+    flush_segment()
     await persist_workflow_session()
+    canvas.close()
     return get_result(data=final_ans)
 
 
@@ -504,6 +539,7 @@ async def create_agent_session(agent_id, tenant_id):
         "version_title": version_title,
     }
     API4ConversationService.save(**conv)
+    canvas.close()
     return get_result(data=_normalize_agent_session(conv))
 
 
@@ -1254,6 +1290,15 @@ def _remap_agent_dsl_for_tenant(dsl: dict, source_tenant_id: str, target_tenant_
                 if target_id:
                     new_ids.append(target_id)
                 else:
+                    # If original id is already a valid bare id in target (same-tenant normal create), keep it
+                    try:
+                        _ok_chk, _m_chk = TenantModelService.get_by_id(llm_id)
+                        if _ok_chk and _m_chk:
+                            new_ids.append(llm_id)
+                            continue
+                    except Exception:
+                        pass
+                    # Otherwise (import where id/name not found), fallback to default
                     fb = _get_default_fallback_id(target_tenant_id, src_model_type, src_model_name or logical)
                     if fb:
                         new_ids.append(fb)
@@ -1453,6 +1498,13 @@ def _remap_agent_dsl_for_tenant(dsl: dict, source_tenant_id: str, target_tenant_
                     if target_id:
                         new_ids.append(target_id)
                     else:
+                        try:
+                            _ok_chk2, _m_chk2 = TenantModelService.get_by_id(llm_id)
+                            if _ok_chk2 and _m_chk2:
+                                new_ids.append(llm_id)
+                                continue
+                        except Exception:
+                            pass
                         fb = _get_default_fallback_id(target_tenant_id, src_model_type, src_model_name or logical)
                         if fb:
                             new_ids.append(fb)
@@ -1744,7 +1796,10 @@ def get_agent_component_input_form(agent_id, component_id, tenant_id):
         if not exists:
             return get_data_error_result(message="canvas not found.")
         canvas = Canvas(json.dumps(user_canvas.dsl), tenant_id, canvas_id=user_canvas.id)
-        return get_json_result(data=canvas.get_component_input_form(component_id))
+        try:
+            return get_json_result(data=canvas.get_component_input_form(component_id))
+        finally:
+            canvas.close()
     except Exception as exc:
         return server_error_response(exc)
 
@@ -1782,6 +1837,7 @@ async def debug_agent_component(agent_id, component_id, tenant_id):
                     for c in iter_obj:
                         txt += c
                 outputs[k] = txt
+        canvas.close()
         return get_json_result(data=outputs)
     except Exception as exc:
         return server_error_response(exc)
@@ -1907,14 +1963,6 @@ async def update_agent(agent_id, tenant_id):
             from agent.canvas import Canvas
 
             req["dsl"] = CanvasReplicaService.normalize_dsl(req["dsl"])
-            # Canonicalize mcp_id/llm_id: portable DSL (name) -> canonical uuid for this tenant.
-            # Keeps import/export cross-server portable, and fixes legacy DSL that stored name
-            # instead of id (would otherwise break Canvas load).
-            try:
-                patched, _warn = _remap_agent_dsl_for_tenant(req["dsl"], tenant_id, tenant_id)
-                req["dsl"] = patched
-            except Exception:
-                logging.exception("update_agent remap skipped")
             Canvas.validate_component_parameters(req["dsl"])
         except ValueError as exc:
             return get_json_result(
@@ -1973,19 +2021,22 @@ async def reset_agent(agent_id, tenant_id):
 
         canvas = Canvas(json.dumps(user_canvas.dsl), tenant_id, canvas_id=user_canvas.id)
         canvas.reset()
-        dsl = json.loads(str(canvas))
-        UserCanvasService.update_by_id(agent_id, {"dsl": dsl})
-        replica_ok = CanvasReplicaService.replace_for_set(
-            canvas_id=agent_id,
-            tenant_id=str(tenant_id),
-            runtime_user_id=str(tenant_id),
-            dsl=dsl,
-            canvas_category=user_canvas.canvas_category,
-            title=user_canvas.title,
-        )
-        if not replica_ok:
-            return get_data_error_result(message="agent reset, but replica sync failed.")
-        return get_json_result(data=dsl)
+        try:
+            dsl = json.loads(str(canvas))
+            UserCanvasService.update_by_id(agent_id, {"dsl": dsl})
+            replica_ok = CanvasReplicaService.replace_for_set(
+                canvas_id=agent_id,
+                tenant_id=str(tenant_id),
+                runtime_user_id=str(tenant_id),
+                dsl=dsl,
+                canvas_category=user_canvas.canvas_category,
+                title=user_canvas.title,
+            )
+            if not replica_ok:
+                return get_data_error_result(message="agent reset, but replica sync failed.")
+            return get_json_result(data=dsl)
+        finally:
+            canvas.close()
     except Exception as exc:
         return server_error_response(exc)
 
@@ -3063,7 +3114,12 @@ async def _webhook_impl(agent_id: str, is_test: bool):
 
         return True
 
-    parsed = await parse_webhook_request(webhook_cfg.get("content_types"))
+    try:
+        parsed = await parse_webhook_request(webhook_cfg.get("content_types"))
+    except Exception as e:
+        canvas.close()
+        return get_data_error_result(code=RetCode.BAD_REQUEST, message=str(e)), RetCode.BAD_REQUEST
+
     SCHEMA = webhook_cfg.get("schema", {"query": {}, "headers": {}, "body": {}})
 
     # Extract strictly by schema
@@ -3072,6 +3128,7 @@ async def _webhook_impl(agent_id: str, is_test: bool):
         header_clean = extract_by_schema(parsed["headers"], SCHEMA.get("headers", {}), name="headers")
         body_clean = extract_by_schema(parsed["body"], SCHEMA.get("body", {}), name="body")
     except Exception as e:
+        canvas.close()
         return get_data_error_result(code=RetCode.BAD_REQUEST, message=str(e)), RetCode.BAD_REQUEST
 
     clean_request = {"query": query_clean, "headers": header_clean, "body": body_clean, "input": parsed}
@@ -3098,9 +3155,11 @@ async def _webhook_impl(agent_id: str, is_test: bool):
         try:
             status = int(status)
         except (TypeError, ValueError):
+            canvas.close()
             return get_data_error_result(code=RetCode.BAD_REQUEST, message=str(f"Invalid response status code: {status}")), RetCode.BAD_REQUEST
 
         if not (200 <= status <= 399):
+            canvas.close()
             return get_data_error_result(code=RetCode.BAD_REQUEST, message=str(f"Invalid response status code: {status}, must be between 200 and 399")), RetCode.BAD_REQUEST
 
         body_tpl = response_cfg.get("body_template", "")
@@ -3166,6 +3225,8 @@ async def _webhook_impl(agent_id: str, is_test: bool):
                         )
                     except Exception:
                         logging.exception("Failed to append webhook trace")
+            finally:
+                canvas.close()
 
         task = asyncio.create_task(background_run())
         if isinstance(task, asyncio.Task):
@@ -3234,6 +3295,8 @@ async def _webhook_impl(agent_id: str, is_test: bool):
                         },
                     )
                 return {"code": 400, "message": str(e), "success": False}
+            finally:
+                canvas.close()
 
         result = await sse()
         return Response(
