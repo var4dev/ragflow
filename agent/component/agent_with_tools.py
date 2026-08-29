@@ -103,7 +103,35 @@ class Agent(LLM, ToolBase):
 
         tool_idx = len(self.tools)
         for mcp in self._param.mcp:
-            _, mcp_server = MCPServerService.get_by_id(mcp["mcp_id"])
+            mcp_id = mcp.get("mcp_id") or mcp.get("id")
+            if not mcp_id:
+                _logger.warning(f"Skip MCP entry without mcp_id in agent {self._id}")
+                continue
+            ok, mcp_server = MCPServerService.get_by_id(mcp_id)
+            # Fallback: DSL may contain portable name (e.g. "user-management-mcp") instead of uuid
+            # after cross-server export/import or legacy save.
+            if not ok or not mcp_server:
+                try:
+                    ok2, q = MCPServerService.get_by_name_and_tenant(mcp_id, self._canvas.get_tenant_id())
+                    if ok2 and q is not None:
+                        # get_by_name_and_tenant returns (bool, queryset/list)
+                        try:
+                            if isinstance(q, (list, tuple)):
+                                mcp_server = q[0] if q else None
+                            else:
+                                # Peewee ModelSelect
+                                mcp_server = q[0] if len(q) > 0 else None  # type: ignore
+                        except Exception:
+                            mcp_server = q  # type: ignore
+                        ok = mcp_server is not None
+                    else:
+                        mcp_server = None
+                        ok = False
+                except Exception:
+                    ok, mcp_server = False, None
+            if not ok or not mcp_server:
+                _logger.warning(f"Skip missing MCP server {mcp_id} for agent {self._id} - not found by id nor name")
+                continue
             custom_header = self._param.custom_header
             tool_call_session = MCPToolCallSession(mcp_server, mcp_server.variables, custom_header)
             for tnm, meta in mcp["tools"].items():
